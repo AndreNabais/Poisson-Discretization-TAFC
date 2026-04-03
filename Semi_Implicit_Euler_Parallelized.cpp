@@ -8,18 +8,17 @@
 using namespace std;
 
 // ==========================================
-// PARÂMETROS GLOBAIS
+// PARÂMETROS GLOBAIS (Teunissen 3.4)
 // ==========================================
-const int n = 500;               // 500 células 
-const double L = 0.01;            // 10 mm
-const double dx = 20e-6;          // 20 um
-const double dt = 80e-12;         // 80 ps (Passo grande do Semi-Implícito)
+const int n = 500;               
+const double dx = 20e-6;          
+const double dt = 80e-12;         
 const double epsilon = 8.854187817e-12;
 const double e_charge = 1.602176634e-19;
-const int p = omp_get_max_threads();                 // o código pergunta ao computador quantas threads tem
+const int p = omp_get_max_threads(); 
 
 // ==========================================
-// SOLVER SPIKE PARA SEMI-IMPLÍCITO
+// SOLVER SPIKE 
 // ==========================================
 class SpikeSolver {
 public:
@@ -32,19 +31,18 @@ public:
     }
 
     void solve_spike(double V_L, double V_R) {
-        // FASE 1: Eliminação Local (Paralela)
+        // FASE 1: Eliminação Local 
         #pragma omp parallel
         {
             int tid = omp_get_thread_num();
             int start = tid * m;
             int end = (tid == p - 1) ? n : (tid + 1) * m;
 
-            // Inicializar Spikes
             for(int i=start; i<end; i++) v[i] = w[i] = 0.0;
             if (tid > 0) v[start] = a[start];
             if (tid < p - 1) w[end - 1] = c[end - 1];
 
-            // Thomas Local (Eliminação)
+            // Thomas Local
             for (int i = start + 1; i < end; i++) {
                 double mf = a[i] / b[i - 1];
                 b[i] -= mf * c[i - 1];
@@ -52,7 +50,6 @@ public:
                 v[i] -= mf * v[i - 1];
             }
 
-            // Back-substitution local
             solution[end - 1] = d[end - 1] / b[end - 1];
             v[end - 1] /= b[end - 1];
             w[end - 1] /= b[end - 1];
@@ -64,36 +61,52 @@ public:
             }
         }
 
-        // FASE 2: Sistema Reduzido (Sequencial)
+        // FASE 2: Sistema Reduzido Global (Gaussiana Corrigida) 
         int n_red = 2 * (p - 1);
-        vector<double> ra(n_red, 0.0), rb(n_red, 1.0), rc(n_red, 0.0), rd(n_red, 0.0);
+        vector<vector<double>> M(n_red, vector<double>(n_red + 1, 0.0));
 
         for (int k = 0; k < p - 1; k++) {
             int i_end = (k + 1) * m - 1;
             int i_next = (k + 1) * m;
-            rd[2 * k] = solution[i_end];
-            if (k > 0) ra[2 * k] = v[i_end]; 
-            rc[2 * k] = w[i_end];
-            rd[2 * k + 1] = solution[i_next];
-            ra[2 * k + 1] = v[i_next];
-            if (k < p - 2) rc[2 * k + 1] = w[i_next];
+            int r_end = 2 * k;
+            int r_next = 2 * k + 1;
+
+            M[r_end][r_end] = 1.0;
+            if (k > 0) M[r_end][r_end - 2] = v[i_end]; 
+            M[r_end][r_next] = w[i_end];
+            M[r_end][n_red] = solution[i_end];
+
+            M[r_next][r_next] = 1.0;
+            M[r_next][r_end] = v[i_next];
+            if (k < p - 2) M[r_next][r_next + 2] = w[i_next];
+            M[r_next][n_red] = solution[i_next];
         }
 
-        for (int i = 1; i < n_red; i++) {
-            double mf = ra[i] / rb[i - 1];
-            rb[i] -= mf * rc[i - 1];
-            rd[i] -= mf * rd[i - 1];
+        // Eliminação Gaussiana com Pivotagem Parcial 
+        for (int col = 0; col < n_red; col++) {
+            int pivot = col;
+            for (int row = col + 1; row < n_red; row++)
+                if (fabs(M[row][col]) > fabs(M[pivot][col])) pivot = row;
+            swap(M[col], M[pivot]);
+
+            for (int row = 0; row < n_red; row++) {
+                if (row != col && fabs(M[col][col]) > 1e-30) {
+                    double f = M[row][col] / M[col][col];
+                    for (int j = col; j <= n_red; j++) M[row][j] -= f * M[col][j];
+                }
+            }
         }
-        vector<double> res_vec(n_red);
-        res_vec[n_red - 1] = rd[n_red - 1] / rb[n_red - 1];
-        for (int i = n_red - 2; i >= 0; i--) res_vec[i] = (rd[i] - rc[i] * res_vec[i + 1]) / rb[i];
+
+        vector<double> res(n_red);
+        for (int i = 0; i < n_red; i++)
+            res[i] = (fabs(M[i][i]) > 1e-30) ? M[i][n_red] / M[i][i] : 0.0;
 
         for (int k = 0; k < p - 1; k++) {
-            solution[(k + 1) * m - 1] = res_vec[2 * k];
-            solution[(k + 1) * m] = res_vec[2 * k + 1];
+            solution[(k + 1) * m - 1] = res[2 * k];
+            solution[(k + 1) * m] = res[2 * k + 1];
         }
 
-        // FASE 3: Correção Final (Paralela)
+        // FASE 3: Correção Final 
         #pragma omp parallel
         {
             int tid = omp_get_thread_num();
@@ -109,7 +122,6 @@ public:
             }
         }
 
-        // Extrair Campo Elétrico
         #pragma omp parallel for
         for (int i = 0; i < n - 1; i++) 
             ElectricField[i] = -(solution[i + 1] - solution[i]) / dx;
@@ -117,7 +129,7 @@ public:
 };
 
 // ==========================================
-// CLASSE SEMI-IMPLICIT SOLVER
+// CLASSE SEMI-IMPLICIT SOLVER 
 // ==========================================
 class SemiImplicitSolver {
 public:
@@ -136,24 +148,25 @@ public:
     double koren(double r) { return max(0.0, min({1.0, (2.0 + r) / 6.0, r})); }
 
     void solve_modified_poisson(double V_L, double V_R) {
-        // 1. Permissividade Efetiva (Paralelo)
+        // 1. Permissividade Efetiva na face (i+1/2)
         #pragma omp parallel for
         for (int i = 0; i < n - 1; i++) {
             double n_e_face = 0.5 * (n_e[i] + n_e[i+1]);
             eps_eff[i] = epsilon + e_charge * dt * mu * n_e_face;
         }
 
-        // 2. Montar Matriz Spike (Paralelo)
+        // 2. Montar Matriz Modificada 
         #pragma omp parallel for
         for (int i = 1; i < n - 1; i++) {
             spike.a[i] = -eps_eff[i-1] / (dx * dx);
             spike.c[i] = -eps_eff[i] / (dx * dx);
             spike.b[i] = -(spike.a[i] + spike.c[i]);
             double diff_div = D_e * (n_e[i+1] - 2.0 * n_e[i] + n_e[i-1]) / (dx * dx);
+            spike.d[i] = e_charge * (n_p[i] - n_e[i]) - e_charge * dt * diff_div * e_charge / e_charge; 
             spike.d[i] = e_charge * (n_p[i] - n_e[i]) - e_charge * dt * diff_div;
         }
 
-        // 3. Fronteiras Dirichlet
+        // 3. Fronteiras Dirichlet (com parede a dx/2) 
         spike.c[0] = -eps_eff[0] / (dx * dx); spike.a[0] = 0.0;
         spike.b[0] = -spike.c[0] + 2.0 * epsilon / (dx * dx);
         double diff_div_0 = D_e * (n_e[1] - 2.0 * n_e[0] + 0.0) / (dx * dx);
@@ -197,10 +210,40 @@ public:
             }
             Gamma[i] = g_drift - D_e * (n_e[i+1] - n_e[i]) / dx;
         }
-        #pragma omp parallel for
+        #pragma omp parallel for 
         for (int i = 2; i < n - 2; i++) n_e[i] += dt * (-(Gamma[i] - Gamma[i-1]) / dx);
     }
 };
+
+int main() {
+    SemiImplicitSolver plasma;
+    double target_time = 50e-9;
+    int total_steps = target_time / dt;
+
+    cout << "Threads OpenMP: " << omp_get_max_threads() << " | Passos: " << total_steps << endl;
+    double start = omp_get_wtime();
+
+    for (int t = 0; t <= total_steps; t++) {
+        plasma.solve_modified_poisson(10000.0, 0.0);
+        plasma.euler_transport_step();
+        if (t % (total_steps / 10) == 0) 
+            cout << "Progresso: " << (t * 100) / total_steps << "% | Tempo: " << omp_get_wtime() - start << "s" << endl;
+    }
+
+    ofstream denFile("density_semi_spike2.csv");
+    denFile << "cell,electron_density\n";
+    for (int i = 0; i < n; i++) denFile << i << "," << plasma.n_e[i] << "\n";
+    denFile.close();
+
+    plasma.solve_standard_poisson(10000.0, 0.0);
+    ofstream eFile("efield_semi_spike2.csv");
+    eFile << "cell,electric_field\n";
+    for (int i = 0; i < n - 1; i++) eFile << i << "," << plasma.spike.ElectricField[i] << "\n";
+    eFile.close();
+
+    cout << "Concluido em: " << omp_get_wtime() - start << " s" << endl;
+    return 0;
+}
 
 int main() {
     SemiImplicitSolver plasma;
